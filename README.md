@@ -1,6 +1,6 @@
 # **RoleRadar:** _Semantic Resume-to-Job Matching Engine_
 
-> [::warning] This project is actively under development
+> :warning: This project is actively under development
 
 ## Overview
 
@@ -18,8 +18,8 @@ The goal is to move beyong keyword matching and build a context-aware resume-to-
 
 ---
 
-## |Component | Status|
-
+## Status
+|Component | Status|
 |---|---|
 |Resume Parsing Agent | Working|
 |Job Fetching | Working|
@@ -46,6 +46,7 @@ RoleRadar instead:
 - Returns final ranked matches with explanation
 
 ## System Architecture
+![System_design](assets/Role_Radar_sys_arch.png)
 
 High-level architecture:
 
