@@ -1,15 +1,21 @@
+from bson import ObjectId
 from pydantic import BaseModel, Field
 import datetime
 
-from data_models import Experience, Education, Certificate, Projects
+from schemas.data_models import Experience, Education, Certificate, Projects
 
 
 def get_utc_timestamp() -> str:
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S %z")
 
 
+class DummyTable(BaseModel):
+    name: str
+    company: str
+
+
 class UserProfileFullModel(BaseModel):
-    _id: str
+    user_id: str
     summary: str | None = None
     skills: list[str]
     industry_experience: list[Experience] | None = None
@@ -17,15 +23,22 @@ class UserProfileFullModel(BaseModel):
     projects: list[Projects] | None = None
     education: list[Education]
     certificates: list[Certificate] | None = None
-    profile_version: int
+    version: int = 0
+    resume_hash: str
+    is_active: bool = True
+    created_at: str
     last_updated_at: str = Field(default_factory=get_utc_timestamp)
 
 
 class UserProfileShortModel(BaseModel):
-    _id: str
+    user_id: str
+    full_profile_id: str
     profile: str
-    profile_version: int
+    prev_roles: list[str] | None
+    all_skills: list[str]
+    embeddings_status: str = 'pending'
     last_updated_at: str = Field(default_factory=get_utc_timestamp)
+    created_at: str
 
 
 class RoleModel(BaseModel):
@@ -49,19 +62,37 @@ class SkillsModel(BaseModel):
     good_to_have: list[str]
 
 
-class JobPostingsModel(BaseModel):
-    _id: str
+class JobPostingsModel_DB(BaseModel):
+    id: str
     company: str
     role: str
     location: str
     contract_type: str
     contract_time: str
     posted_on: str
-    responsibilities: list[str]
-    company_description: str
-    skills: SkillsModel
-    additional_requirements: str | None = None
-    url: str
+    responsibilities: list[str] | None
+    skills_required: list[str] | None
+    qualifications: list[str] | None
+    skills_optional: list[str] | None
+    additional_requirements: list[str] | None
+    redirect_url: str
+    keywords: list[str] | None = None
+    job_hashed: str
+    what: str
+    where: str
+    last_seen_at: str = Field(default_factory=get_utc_timestamp)
+    last_updated_at: str = Field(default_factory=get_utc_timestamp)
+    created_at: str = Field(default_factory=get_utc_timestamp)
+
+
+class BriefJobPostingsModel(BaseModel):
+    id: str
+    role: str
+    profile: str
+    skills_required: list[str]
+    skills_optional: list[str]
+    full_profile_id: str
+    created_at: str = Field(default_factory=get_utc_timestamp)
     last_updated_at: str = Field(default_factory=get_utc_timestamp)
 
 

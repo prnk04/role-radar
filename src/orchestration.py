@@ -3,11 +3,15 @@ from typing import List, Optional, TypedDict, Any
 from langgraph.graph import StateGraph, END, START
 
 import logging
+from src.rol_match import role_resume_matching_graph
 from src.utils.error_handler import log_error
 
 from src.resume_parser import resume_parser_agent
 from src.job_search_async import job_search_agent
 from src.role_resume_matcher import role_resume_matching_agent
+
+from pymongo.database import Database
+
 # Setup logging
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
@@ -36,9 +40,9 @@ class OrchestrationState(TypedDict):
     recommended_postings: Any
 
 
-def parse_resume(state: OrchestrationState):
+def parse_resume(db: Database, state: OrchestrationState):
     try:
-        resume_parser = resume_parser_agent()
+        resume_parser = resume_parser_agent(db=db)
 
         resume_parser_res = resume_parser.invoke(
             {
@@ -65,24 +69,11 @@ def parse_resume(state: OrchestrationState):
         )
 
 
-def job_fetch_step(state: OrchestrationState):
-    js_agent = job_search_agent().compile()
+def job_fetch_step(state: OrchestrationState, db):
+    js_agent = job_search_agent(db).compile()
     result = js_agent.invoke(
         {
-            # "titles": (
-            #     state["selected_roles"]
-            #     if state["selected_roles"] is not None
-            #     else list()
-            # ),
-            # "location": state["location"],
-            # "jobs": [],
-            # "page_number": 1,
-            # "max_pages": 1,
-            # "threshold": 20,
-            # "empty_page_count": 0,
-            # "country": "",
-            # "country_code": "",
-            # "keywords": [],
+
             "jobs": [],
             "page_number": 1,
             "max_pages": 1,
@@ -94,45 +85,53 @@ def job_fetch_step(state: OrchestrationState):
             "country": "",
             "country_code": "",
             "keywords": [],
+            "job_hashed_list": []
         }
     )
     return {"searched_jobs": result["jobs"]}
 
 
 def role_resume_match(state: OrchestrationState):
-    role_resume_match_agent = role_resume_matching_agent()
+    role_resume_match_agent = role_resume_matching_graph()
     result = role_resume_match_agent.invoke({
-        "final_evaluation": None,
-        "inital_evaluation": None,
-        "job_posting_file_path": "",
-        "job_postings": state['searched_jobs'],
-        "resume_file_path": "",
-        "user_prev_roles": [],
-        "user_profile": "",
-        "user_resume": state["resume_contents"],
-        "user_skills": []
+        "matching_jobs_chroma": [],
+        "recommended_jobs": [],
+        "user_email_id": state['resume_contents'].get("email_id", '') if state['resume_contents'] is not None else "",
+        "user_profile": {},
+        "user_skills": {},
+        "where": state['location'],
+        "what": state['selected_roles']
     })
 
-    logging.info(f"Hey!\n{result["final_evaluation"]}")
+    logging.info(f"Hey!\n{result["recommended_jobs"]}")
     return {
-        "recommended_postings": result["final_evaluation"]
+        "recommended_postings": result["recommended_jobs"]
     }
 
 
-def orchestrateAgent(state: OrchestrationState):
+def orchestrateAgent(db: Database):
     try:
+
         graph = StateGraph(OrchestrationState)
 
-        graph.add_node("resume_step", parse_resume)
-        graph.add_node("job_fetch_step", job_fetch_step)
+        def get_resume_parser_agent(state):
+            return parse_resume(db, state=state)
+
+        def get_job_search_agent(state):
+            return job_fetch_step(state=state, db=db)
+
+        graph.add_node("resume_step", get_resume_parser_agent)
+        graph.add_node("job_fetch_step", get_job_search_agent)
         graph.add_node("job_profile_matching", role_resume_match)
 
         # graph.set_entry_point("parse_resume")
         graph.add_edge("resume_step", END)
         graph.add_edge("job_fetch_step", "job_profile_matching")
         graph.add_edge("job_profile_matching", END)
+        # graph.add_edge("job_fetch_step", END)
 
         def get_stage(state: OrchestrationState):
+            logging.info(f"Starting: {state}")
             return state["starting_point"]
 
         # graph.add_edge(START, "resume_step")
@@ -148,26 +147,13 @@ def orchestrateAgent(state: OrchestrationState):
         return None
 
 
-def start_agent(details):
+def start_agent(db: Database, details):
     file_path = details.get("resume_path")
     roles = details.get("roles")
     locations = details.get("locations")
     session_id = details.get("session_id")
 
-    orchestrator = orchestrateAgent(
-        {
-            "resume_file_path": file_path,
-            "resume_contents": dict(),
-            "suggested_roles": [],
-            "user_query": "",
-            "location": locations,
-            "targetted_roles": roles,
-            "selected_roles": [],
-            "starting_point": "",
-            "searched_jobs": [],
-            "recommended_postings": None
-        }
-    )
+    orchestrator = orchestrateAgent(db)
 
     if orchestrator is None:
         print("Orchestrator is none. not sure why")

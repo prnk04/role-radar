@@ -1,4 +1,5 @@
 import asyncio
+import functools
 import time
 import aiohttp
 import bs4
@@ -15,12 +16,19 @@ from langgraph.graph import StateGraph, END, START
 
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnableLambda
+# from pymongo.database import Database
+from pymongo.asynchronous.database import AsyncDatabase
 
 
 import logging
 
 from pydantic import BaseModel
+from src.utils.commons import get_hashed
+from schemas.database_schema import BriefJobPostingsModel, JobPostingsModel_DB
+from src.database.store_job_postings import bulk_store_job_profiles, bulk_store_jobs, store_job_posting, store_job_profiles
 from src.utils.error_handler import log_error
+from src.vectors.store_job_profiles import store_job_profile_vector
+
 
 # Setup logging
 logging.basicConfig(
@@ -49,6 +57,7 @@ class JobSearchState(TypedDict):
     threshold: int
     empty_page_count: int
     keywords: List
+    job_hashed_list: List
 
 
 class SkillsModel(BaseModel):
@@ -90,19 +99,33 @@ class JobPostingsModel1(BaseModel):
     contract_type: str
     contract_time: str
     posted_on: str
-    responsibilities: list[dict[str, str]]
-    skills_required: list[dict[str, str]]
-    qualifications: list[dict[str, str]]
-    skills_optional: list[dict[str, str]]
-    additional_requirements: list[dict[str, str]]
+    responsibilities: list[str]
+    skills_required: list[str]
+    qualifications: list[str]
+    skills_optional: list[str]
+    additional_requirements: list[str]
     redirect_url: str
     keywords: list[str] | None = None
+    job_hashed: str
 
 
+def logging_decorator(func):
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        start_time = time.time()
+        print(f"Inside function {func.__name__}")
+        result = func(*args, **kwargs)
+        end_time = time.time()
+        print(f"Finished function {func.__name__} in {end_time - start_time}")
+        return result
+    return wrapper
+
+
+@logging_decorator
 def checkLLMResponse(llm_res):
     this_res = llm_res
     llm_res_content = llm_res.content
-    logging.info(f"Inside check llm res: {llm_res_content}")
+    # logging.info(f"Inside check llm res")
     if llm_res_content is not None and type(llm_res_content) == str:
         logging.info(f"llm_res is not none, also it is of type str")
         if str(llm_res_content).__contains__("```"):
@@ -111,80 +134,21 @@ def checkLLMResponse(llm_res):
             this_res = str(llm_res_content).split("\n\n")[1]
         elif str(llm_res_content).startswith("{"):
             this_res = llm_res.content
-    logging.info(f"Returning {this_res}")
+    # logging.info(f"Returning from checkLLMResponse")
     return this_res
 
 
+@logging_decorator
 async def get_structured_data_async(data):
     """
     Async version: Fetches company name, job title, roles and responsibilities, skills from the HTML input
     :param data: section part of the HTML that contains details about the job posting
     """
     try:
-        # parser = JsonOutputParser(pydantic_object=JobPostingsModel)
-        # prompt = ChatPromptTemplate.from_messages([
-        #     ("system",  """
-        #                     You are an expert in extracting meaningful and structured data from unstructured data.
-        #                     You have worked on countless HTML snippets, and JSON data that has multiple fields conveying the same meaning.
-        #                     You STRICTLY FOLLOW THE FORMAT GIVEN TO YOU TO convert the unstructured data, into meaningful JSON data.
-        #                     STRICTLY FOLLOW THE PROVIDED SCHEMA TO CREATE OUTPUT. {format_instructions}
-        #                 """),
-        #     ("human", """
-        #                 You are given 2 inputs:
-        #                     1. an HTML code snippet, extracted from an internet JOB POSTING, that contains the following information:
-        #                         - company name
-        #                         - company description
-        #                         - responsibilities
-        #                         - qualifications
-        #                         - required skills
-        #                         - optional skills
-        #                         - day in the life of an employee
-        #                         - additional information about benefits, or job role requirements
-        #                         - salary(at times)
-        #                     2. A JSON object that:
-        #                         - also has information regarding the job posting, but partial,
-        #                         - and it contains fields having different names, but conveying the same value/meaning.
-
-        #                 Your task is:
-        #                     - From the HTML snippet for job posting:
-        #                         - extract the mentioned information from the HTML snippet
-        #                         - if any infromation is not present, infer it from other fields. But do not make anything up
-        #                     - Also, given the data, extract keywords that can be used to match a users' skills to the job requirements
-        #                     - Combine the information that you extracted from the HTML code snippet and from the given JSON object:
-        #                         - Remove duplicates
-        #                     - Strictly follow the given schema to create a VALID JSON object.
-
-        #                 Your output MUST match this exact structure:
-        #                 {{
-        #                     "id": "string",
-        #                     "company": "string",
-        #                     "role": "string",
-        #                     "location": "string",
-        #                     "contract_type": "string",
-        #                     "contract_time": "string",
-        #                     "posted_on": "string",
-        #                     "responsibilities": ["string1", "string2"],
-        #                     "company_description": "string",
-        #                     "qualifications" : "string" // Education, years of experience
-        #                     "skills": {{
-        #                         "must_have": ["skill1", "skill2"],
-        #                         "good_to_have": ["skill3", "skill4"]
-        #                     }},
-        #                     "additional_requirements": "string or null",
-        #                     "redirect_url": "string",
-        #                     "keywords":["keyword1", "keyword2"]
-        #                 }}
-
-        #                 DO NOT include: "$ref", "$defs", or any schema references.
-        #                 DO NOT put must_have/good_to_have at root level - they MUST be nested inside "skills".
-
-        #                 HTML_SNIPPET: {html_snippet}
-        #                 json_object: {job_posting_partial}
-
-        #                 """)
-        # ])
 
         parser = JsonOutputParser(pydantic_object=JobPostingsModel1)
+
+        # from_llm(parser=parser, llm=model)
 
         prompt_cl = ChatPromptTemplate.from_messages([
             ("system", """
@@ -242,26 +206,11 @@ async def get_structured_data_async(data):
                 - Did I separate required vs optional appropriately?
                 - Did I maintain original wording without summarizing?
                 - Did I include all technology keywords?
+                - Is the JSON valid?
+                - Does the output JSON contain data that cannot be parsed? If yes- fix it
                 
-                OUTPUT: Valid JSON matching the following schema only:
-            
-                {{
-                    "id":"string",
-                    "company":"string",
-                    "role":"string",
-                    "location":"string",
-                    "posted_on":"string",
-                    "contract_type":"string",
-                    "contract_time":"string",
-                    "responsibilities": [dict("text":"string")],
-                    "qualifications": [dict("text":"string")],
-                    "skills_required": [dict("text":"string")],
-                    "skills_optional": [dict("text":"string")],
-                    "additional_requirements": [dict("text":"string")],
-                    "redirect_url":"string",
-                    "keywords":["string]               
-                        
-                }} 
+             
+             Always provide ONLY VALID JSON OUTPUT. 
             
                 HTML_SNIPPET: {html_snippet}
                 JSON_OBJECT: {job_posting_partial}
@@ -271,10 +220,7 @@ async def get_structured_data_async(data):
         prompt_cl = prompt_cl.partial(
             format_instructions=parser.get_format_instructions())
 
-        # prompt = prompt_cl.partial(
-        #     format_instructions=parser.get_format_instructions())
-
-        model = ChatOllama(model=MODEL_NAME, temperature=0.0)
+        model = ChatOllama(model=MODEL_NAME, temperature=0.0, format="json")
 
         chain = prompt_cl | model | RunnableLambda(
             checkLLMResponse) | parser
@@ -294,8 +240,14 @@ async def get_structured_data_async(data):
                     })
                 )
                 if llm_res and llm_res is not None and type(llm_res) == dict:
+                    # logging.info(f"llm res is: {llm_res}")
+                    # logging.info(
+                    #     f"And the snippet was: {data['job_posting_partial']}")
                     llm_res['id'] = data["job_posting_partial"].get("id")
-                logging.info(f"Intermediate response: {llm_res}")
+                    llm_res['redirect_url'] = llm_res.get("redirect_url") or data["job_posting_partial"].get(
+                        "redirect_url")
+                    llm_res["job_hashed"] = data["job_posting_partial"].get(
+                        "job_hashed")
                 return llm_res
 
             except Exception as e:
@@ -317,6 +269,7 @@ async def get_structured_data_async(data):
         return None
 
 
+@logging_decorator
 async def fetch_redirect_url_async(session: aiohttp.ClientSession, url: str, timeout: int = 30):
     """
     Async function to fetch content from redirect URL
@@ -327,7 +280,7 @@ async def fetch_redirect_url_async(session: aiohttp.ClientSession, url: str, tim
                 logging.error(
                     f"Redirect URL returned status {response.status}: {url}")
                 if response.status == 403:
-                    logging.info("Returning 403")
+                    # logging.info("Returning 403")
                     return {"status": 403, "url": url}
                 return None
 
@@ -335,12 +288,19 @@ async def fetch_redirect_url_async(session: aiohttp.ClientSession, url: str, tim
             return {"status": 200, "text": text, "url": url}
     except asyncio.TimeoutError:
         logging.error(f"Timeout fetching redirect URL: {url}")
+        log_error(
+            f"Timeout fetching redirect URL: {url}"
+        )
         return None
     except Exception as e:
         logging.error(f"Error fetching redirect URL {url}: {e}")
+        log_error(
+            f"Error fetching redirect URL {url}: {e}"
+        )
         return None
 
 
+@logging_decorator
 async def extract_job_requirements_async(job_data, session: aiohttp.ClientSession):
     """
     Async version: Extract details of job posting from the result of calling Adzuna API
@@ -349,7 +309,9 @@ async def extract_job_requirements_async(job_data, session: aiohttp.ClientSessio
     :param session: aiohttp session for making requests
     """
     jobs_to_send = dict()
+    job_details_hashed = ""
     try:
+
         company_name = job_data.get("display_name", "NA")
         job_title = job_data.get("title", "NA")
         description = job_data.get("description", "NA")
@@ -360,6 +322,9 @@ async def extract_job_requirements_async(job_data, session: aiohttp.ClientSessio
         more_details_url = job_data.get("redirect_url", "NA")
         adRef = job_data.get("adref", "NA")
 
+        job_details = f"""{job_data.get("id")}|{company_name}|{job_title}|{description}|{contract_time}|{job_location}|{contract_type}"""
+        job_details_hashed = get_hashed(job_details)
+
         job_details_to_show = {
             "id": job_data.get("id", "NA"),
             "company_from_api": company_name,
@@ -369,7 +334,8 @@ async def extract_job_requirements_async(job_data, session: aiohttp.ClientSessio
             "contract_time_from_api": contract_time,
             "contract_type_from_api": contract_type,
             "company_description_from_api": description,
-            "redirect_url": more_details_url
+            "redirect_url": more_details_url,
+            "job_hashed": job_details_hashed
         }
 
         jobs_to_send = {
@@ -381,7 +347,8 @@ async def extract_job_requirements_async(job_data, session: aiohttp.ClientSessio
             "contract_type": contract_type,
             "contract_time": contract_time,
             "company_description": description,
-            "redirect_url": more_details_url
+            "redirect_url": more_details_url,
+            "job_hashed": job_details_hashed
         }
 
         # Async fetch of redirect URL
@@ -395,8 +362,8 @@ async def extract_job_requirements_async(job_data, session: aiohttp.ClientSessio
 
             job_details_to_show["redirect_url"] = more_details_url
             mod_details = await extract_data_from_description(description)
-            print("="*90)
-            logging.info(f"Mod details: {mod_details}")
+
+            # logging.info(f"Mod details: {mod_details}")
             if mod_details is not None:
                 jobs_to_send = {
                     "id": job_data.get("id", "NA"),
@@ -410,7 +377,8 @@ async def extract_job_requirements_async(job_data, session: aiohttp.ClientSessio
                     "responsibilities": mod_details.get("responsibilities", []),
                     "skills": mod_details.get("responsibilities", []),
                     "additional_requirements": mod_details.get("additional_requirements", ''),
-                    "redirect_url": more_details_url or mod_details.get('more_details_url', '')
+                    "redirect_url": more_details_url or mod_details.get('more_details_url', ''),
+                    "job_hashed": job_details_hashed
                 }
             return jobs_to_send
 
@@ -488,6 +456,7 @@ async def extract_job_requirements_async(job_data, session: aiohttp.ClientSessio
         return jobs_to_send
 
 
+@logging_decorator
 async def process_jobs_concurrently(jobs_list: List[dict], max_concurrent: int = 5):
     """
     Process multiple job postings concurrently with a concurrency limit
@@ -503,7 +472,9 @@ async def process_jobs_concurrently(jobs_list: List[dict], max_concurrent: int =
 
     async with aiohttp.ClientSession() as session:
         tasks = [process_with_semaphore(job, session) for job in jobs_list]
+
         results = await asyncio.gather(*tasks, return_exceptions=True)
+        # logging.info(f"results: {results}")
 
     # Filter out None results and exceptions
     valid_results = []
@@ -516,6 +487,7 @@ async def process_jobs_concurrently(jobs_list: List[dict], max_concurrent: int =
     return valid_results
 
 
+@logging_decorator
 async def extract_data_from_description(data):
     """
     Infers data from the description field of the API result
@@ -538,24 +510,7 @@ async def extract_data_from_description(data):
                         Extract all the details, and use them to populate the JSON.
                         Also, given the data, extract keywords that can be used to match a users' skills to the job requirements
              
-                        Your output MUST match this exact structure:
-                            {{
-                                "id":"string",
-                                "company":"string",
-                                "role":"string",
-                                "location":"string",
-                                "posted_on":"string",
-                                "contract_type":"string",
-                                "contract_time":"string",
-                                "responsibilities": [dict("text":"string")],
-                                "qualifications": [dict("text":"string")],
-                                "skills_required": [dict("text":"string")],
-                                "skills_optional": [dict("text":"string")],
-                                "additional_requirements": [dict("text":"string")],
-                                "redirect_url":"string",
-                                "keywords":["string]
-                            }}
-
+                        
                         DO NOT include: "$ref", "$defs", or any schema references.
                         DO NOT put must_have/good_to_have at root level - they MUST be nested inside "skills".
                         - Strictly follow the given schema to create a VALID JSON object.
@@ -569,14 +524,14 @@ async def extract_data_from_description(data):
         prompt = prompt.partial(
             format_instructions=parser.get_format_instructions())
 
-        model = ChatOllama(model=MODEL_NAME, temperature=0.0)
+        model = ChatOllama(model=MODEL_NAME, temperature=0.0, format="json")
 
         chain = prompt | model | RunnableLambda(
             checkLLMResponse) | parser
         max_attempts = 3
         for attempt in range(max_attempts):
             try:
-                logging.info(f"Attempt: {attempt}")
+                # logging.info(f"Attempt: {attempt}")
 
                # Run LLM call in executor to avoid blocking
                 loop = asyncio.get_event_loop()
@@ -586,7 +541,8 @@ async def extract_data_from_description(data):
                         "text": data
                     })
                 )
-                logging.info(f"Intermediate response: {llm_res}")
+                # logging.info(f"Intermediate response: {llm_res}")
+
                 return llm_res
             except Exception as e:
                 logging.error(
@@ -606,7 +562,184 @@ async def extract_data_from_description(data):
         return None
 
 
-async def search_jobs_adzuna_async(state: JobSearchState):
+@logging_decorator
+def extract_job_data(data, extra=None):
+    try:
+        formatted_data = ""
+        extra_return = None
+        if extra == "skills":
+            pass
+
+        if data is not None:
+            if type(data) == dict:
+                formatted_data += "|".join(["|".join(x.split(","))
+                                           for x in data.values() if isinstance(x, str)])
+
+            elif type(data) == list:
+                this_res = ""
+                for res in data:
+                    if type(res) == dict:
+                        this_res += "|".join(["|".join(x.split(","))
+                                             for x in res.values() if isinstance(x, str)])
+                        this_res += "|"
+                    elif type(res) == list:
+                        this_res += "|".join(["|".join(x.split(","))
+                                             for x in res if isinstance(x, str)])
+                        this_res += "|"
+
+                    elif type(res) == str:
+                        this_res += "".join(["|".join(x.split(","))
+                                            for x in res if isinstance(x, str)])
+                        this_res += "|"
+                formatted_data += this_res
+
+            elif type(data) == str:
+                formatted_data += "|".join(data.split(","))
+                formatted_data += "|"
+        return formatted_data, formatted_data.split("|")
+    except Exception as e:
+        logging.error(f"Error occurred in extracting job data: {e}")
+        log_error(f"Error occurred in extracting job data: {e}")
+        return str(data), None
+
+
+@logging_decorator
+def clean_text_list(thisList):
+    data_to_send = list()
+    for thisData in thisList:
+        modified_data = ",".join([x.strip() for x in thisData.split("(")])
+        modified_data = ",".join([x.strip() for x in modified_data.split(")")])
+        modified_data = ",".join([x.strip() for x in modified_data.split("&")])
+        data_to_send.extend(
+            [x.strip() for x in modified_data.split(",") if len(x) > 0])
+
+    data_to_send = list([x.strip()
+                        for x in data_to_send if len(x.strip()) > 0])
+
+    return data_to_send
+
+
+@logging_decorator
+def create_job_profile(job_data):
+    try:
+        # job_data = state['job_postings']
+        if type(job_data) == dict:
+            job_profile = ""
+            job_role = ""
+            job_skills_required = list()
+            job_skills_optional = list()
+            role = job_data.get('role')
+            responsibilities = job_data.get("responsibilities")
+            qualifications = job_data.get("qualifications")
+            skills_required = job_data.get("skills_required")
+            skills_optional = job_data.get("skills_optional")
+            additional_requirements = job_data.get("additional_requirements")
+            keywords = job_data.get("keywords")
+
+            job_profile += f"{role}|" if role is not None else "|"
+            job_profile += extract_job_data(responsibilities)[0]
+            job_profile += extract_job_data(qualifications)[0]
+            data, skills = extract_job_data(skills_optional, "skills")
+            job_profile += data
+            job_skills_required.extend(clean_text_list(skills))
+
+            data, skills = extract_job_data(skills_required, "skills")
+            job_profile += data
+            job_skills_optional.extend(clean_text_list(skills))
+
+            job_profile += extract_job_data(additional_requirements)[0]
+            data, skills = extract_job_data(keywords, "skills")
+            job_profile += data
+            job_skills_optional.extend(clean_text_list(skills))
+
+            return job_profile, list(set(job_skills_required)), list(set(job_skills_optional)), role
+
+        else:
+            return str(job_data), list(), list(), None
+    except Exception as e:
+        logging.error(f"Error in creating job profile: {e}")
+        log_error(f"Error in creating job profile: {e}")
+        return str(job_data), list(), list(), None
+
+
+@logging_decorator
+async def store_jobs_in_db(jobs, db: AsyncDatabase, what: str, where: str):
+    try:
+        # logging.info(f"Jobs: {jobs}")
+        job_profiles_to_store = list()
+        job_details_to_send = list()
+        for job in jobs:
+            this_job_profile, this_job_skills_reqd, this_job_skills_opt, this_job_role = create_job_profile(
+                job)
+            job_profiles_to_store.append({
+                'id': job.get("id"),
+                'profile': this_job_profile,
+                'skills_required': list() if len(",".join(list(this_job_skills_reqd))) == 0 else list(this_job_skills_reqd),
+                'skills_optional': this_job_skills_opt,
+                'role': this_job_role
+            })
+
+            job_details_to_send.append(JobPostingsModel_DB(
+                id=job.get("id"),
+                company=job.get("company"),
+                role="".join(job.get("role")),
+                location=job.get("location"),
+                posted_on=job.get("posted_on"),
+                contract_type=job.get("contract_type"),
+                contract_time=job.get("contract_time"),
+                responsibilities=[x for x in job.get(
+                    "responsibilities")] if job.get('responsibilities') is not None else [],
+                qualifications=[x for x in job.get("qualifications")] if job.get(
+                    'qualifications') is not None else [],
+                skills_required=[x for x in job.get(
+                    "skills_required")] if job.get('skills_required') is not None else [],
+                skills_optional=[x for x in job.get(
+                    "skills_optional")] if job.get('skills_optional') is not None else [],
+                additional_requirements=[x for x in job.get(
+                    "additional_requirements")] if job.get('additional_requirements') is not None else [],
+                keywords=job.get("keywords", []),
+                redirect_url=job.get("redirect_url"),
+                job_hashed=job.get("job_hashed"),
+                what=what,
+                where=where
+            ))
+        # store_job_posting(job_details_to_send, db)
+        # logging.info(f"I should send: {job_details_to_send}")
+        # res = store_job_profiles(job_profiles_to_store, db)
+        job_id_list = await bulk_store_jobs(job_details_to_send, db)
+        logging.info(f"Here, we have the job ids: {job_id_list}")
+        if job_id_list is not None:
+            for job_profile in job_profiles_to_store:
+                job_profile['full_profile_id'] = str(
+                    job_id_list.get(job_profile.get("id")))
+            job_profiles_to_send = [BriefJobPostingsModel(
+                **x) for x in job_profiles_to_store]
+            res = await bulk_store_job_profiles(
+                job_profiles=job_profiles_to_send, db=db)
+
+            logging.info(f"Result of storing job profile in db: {res}")
+
+            if res is not None:
+                for job_profile in job_profiles_to_store:
+                    store_job_profile_vector(job_id=job_profile.get("id"),
+                                             job_profile=job_profile.get(
+                                                 'profile'),
+                                             job_role=job_profile.get('role'),
+                                             skills_optional=job_profile.get(
+                                                 'skills_optional'),
+                                             skills_reqd=job_profile.get(
+                                                 'skills_optional'),
+                                             what=what,
+                                             where=where,
+                                             db_id=str(res.get(job_profile.get("id"))))
+
+    except Exception as e:
+        logging.error(f"Error in storing jobs in db: {e}\ninput was :{jobs}")
+        log_error(f"Error in storing jobs in db: {e}\ninput was :{jobs}")
+
+
+@logging_decorator
+async def search_jobs_adzuna_async(state: JobSearchState, db: AsyncDatabase):
     """
     Async version: Search for jobs on Adzuna API
     """
@@ -621,19 +754,22 @@ async def search_jobs_adzuna_async(state: JobSearchState):
         page_number = state.get("page_number", 1)
 
         jobs_for_api = []
-        for keyword in state.get("keywords", []):
-            for location in state.get("locations", []):
+        for keyword in set(state.get("keywords", [])):
+            for location in set(state.get("locations", [])):
                 jobs_for_api.append({"what": keyword, "where": location})
+
+        logging.info(f"jobs_for_api: {jobs_for_api}")
 
         jobs_from_api = []
         timeout = aiohttp.ClientTimeout(total=30)
 
-        logging.info(f"cc: {country_code}")
+        # logging.info(f"cc: {country_code}")
 
-        logging.info(f"GHoing to serach for jobs")
+        # logging.info(f"GHoing to serach for jobs")
 
         async with aiohttp.ClientSession() as session:
-            for job in jobs_for_api:
+            for i, job in enumerate(jobs_for_api):
+                logging.info(f"Jobs from api: {i}, {job}")
                 what = job["what"]
                 where = job["where"]
                 filters_to_apply = {
@@ -641,10 +777,10 @@ async def search_jobs_adzuna_async(state: JobSearchState):
                     "app_key": ADZUNA_API_KEY,
                     "what_phrase": what,
                     "where": where,
-                    "results_per_page": 100,
+                    "results_per_page": 10,
                     "full_time": 1,
                     "permanent": 1,
-                    "max_days_old": 120,
+                    "max_days_old": 30,
                 }
 
                 # url = f"{base_url}{str(country_code).lower()}/search/{page_number}?app_id={app_id}&app_key={api_key}&results_per_page=10&what={what}&where={where}&content-type=application/json"
@@ -655,17 +791,35 @@ async def search_jobs_adzuna_async(state: JobSearchState):
                         if response.status == 200:
                             data = await response.json()
                             results = data.get("results", [])
-                            jobs_from_api.extend(results)
+                            # jobs_from_api.extend(results)
 
-                            with open('adzuna_res.json', 'a') as f:
-                                json.dump(data, f)
+                            # logging.info(f"{what} and {where}:\n{results}")
+                            # logging.info(
+                            #     "------------------------------------------")
+
+                            # with open('adzuna_res.json', 'a') as f:
+                            #     json.dump(data, f)
                             logging.info(
                                 f"Found {len(results)} jobs for {what} in {where}")
+                            processed_jobs = await process_jobs_concurrently(results, max_concurrent=10)
+
+                            logging.info(
+                                "++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++")
+                            logging.info(
+                                f"processed jobs: {processed_jobs}")
+                            jobs_from_api.extend(processed_jobs)
+                            if processed_jobs:
+                                x = store_jobs_in_db(
+                                    processed_jobs, db, what, where)
                         else:
                             logging.error(
                                 f"API returned status {response.status} for {what} in {where}: {response.url}")
+                            log_error(
+                                f"API returned status {response.status} for {what} in {where}: {response.url}")
                 except Exception as e:
                     logging.error(
+                        f"Error fetching jobs for {what} in {where}: {e}")
+                    log_error(
                         f"Error fetching jobs for {what} in {where}: {e}")
 
         if len(jobs_from_api) == 0:
@@ -676,11 +830,12 @@ async def search_jobs_adzuna_async(state: JobSearchState):
             }
 
         # Process all jobs concurrently
-        logging.info(f"Processing {len(jobs_from_api)} jobs concurrently...")
-        processed_jobs = await process_jobs_concurrently(jobs_from_api, max_concurrent=10)
+        # logging.info(f"Processing {len(jobs_from_api)} jobs concurrently...")
+        # processed_jobs = await process_jobs_concurrently(jobs_from_api, max_concurrent=10)
 
         added = 0
-        for job in processed_jobs:
+
+        for job in jobs_from_api:
             if job is not None and job not in collected_jobs:
                 collected_jobs.append(job)
                 added += 1
@@ -702,10 +857,12 @@ async def search_jobs_adzuna_async(state: JobSearchState):
         return {"jobs": collected_jobs}
 
 
+@logging_decorator
 def increment_page(state: JobSearchState):
     return {"page_number": state["page_number"] + 1}
 
 
+@logging_decorator
 def should_continue(state: JobSearchState):
     if len(state["jobs"]) >= state["threshold"]:
         return "done"
@@ -719,13 +876,14 @@ def should_continue(state: JobSearchState):
     return "continue"
 
 
+@logging_decorator
 def infer_country(state: JobSearchState):
     """
     Extract country based on locations; later, find a way to store this mapping, so that we do not keep asking the LLM
     """
     try:
-        logging.info(
-            f"Extracting country name and code from the given location")
+        # logging.info(
+        #     f"Extracting country name and code from the given location")
         agent = create_agent(
             model=ChatOllama(model=MODEL_NAME_QWEN_SMALL, temperature=0.0),
             system_prompt=SystemMessage(
@@ -775,6 +933,7 @@ def infer_country(state: JobSearchState):
         return None
 
 
+@logging_decorator
 def normalize_job_titles(state: JobSearchState):
     try:
         parser = JsonOutputParser(pydantic_object=JobTitleKeywordsList)
@@ -792,7 +951,7 @@ def normalize_job_titles(state: JobSearchState):
              "Generate the top search keyword for each of these job titles: {job_titles}")
         ])
 
-        logging.info(f"Fetching keywords corresponding to job titles")
+        # logging.info(f"Fetching keywords corresponding to job titles")
 
         prompt = prompt.partial(
             format_instructions=parser.get_format_instructions())
@@ -804,9 +963,9 @@ def normalize_job_titles(state: JobSearchState):
             {"job_titles": state["titles"]}
         )
 
-        logging.info(
-            f"LLM returned jobs name as: {agent_res}"
-        )
+        # logging.info(
+        #     f"LLM returned jobs name as: {agent_res}"
+        # )
 
         final_list = set()
         if agent_res is None:
@@ -814,9 +973,9 @@ def normalize_job_titles(state: JobSearchState):
         logging.info(f"Here,: {type(agent_res)}")
 
         if type(agent_res) == list:
-            logging.info("It is of type list")
+            # logging.info("It is of type list")
             for res in agent_res:
-                logging.info(f"res: {res}")
+                # logging.info(f"res: {res}")
                 for keywords in res.values():
                     if type(keywords) == list:
                         for job in keywords:
@@ -825,9 +984,9 @@ def normalize_job_titles(state: JobSearchState):
                         final_list.add(keywords)
 
         elif agent_res.get("result") is not None:
-            logging.info("Result exist")
+            # logging.info("Result exist")
             for res in agent_res['result']:
-                logging.info(f"res: {res}")
+                # logging.info(f"res: {res}")
                 for keywords in res.values():
                     if type(keywords) == list:
                         for job in keywords:
@@ -846,7 +1005,8 @@ def normalize_job_titles(state: JobSearchState):
         return {"keywords": state["titles"]}
 
 
-def job_search_agent():
+@logging_decorator
+def job_search_agent(db):
     """
     Create graph for looking for jobs with async support
     """
@@ -857,7 +1017,7 @@ def job_search_agent():
 
     # Wrap async function for LangGraph
     def search_jobs_wrapper(state: JobSearchState):
-        return asyncio.run(search_jobs_adzuna_async(state))
+        return asyncio.run(search_jobs_adzuna_async(state, db=db))
 
     graph.add_node("search_jobs", search_jobs_wrapper)
     graph.add_node("increment_page", increment_page)
@@ -895,21 +1055,22 @@ def start():
     Start the process of looking for job
     """
     start_time = time.time()
-    graph = job_search_agent()
+    graph = job_search_agent(None)
     job_agent = graph.compile()
 
     entities = job_agent.invoke(
         {
             "jobs": [],
             "page_number": 1,
-            "max_pages": 10,
-            "threshold": 500,
+            "max_pages": 1,
+            "threshold": 250,
             "empty_page_count": 0,
             "locations": ["Pune"],
             "titles": ["ML Engineer", "Data Scientist"],
             "country": "",
             "country_code": "",
             "keywords": [],
+            "job_hashed_list": []
         }
     )
 
@@ -926,7 +1087,7 @@ def start():
         print("-" * 100)
     end_time = time.time()
 
-    with open("job_list_llama3_latest_v7.json", "w") as f:
+    with open("job_list_llama3_latest_v8.json", "w") as f:
         json.dump({"time": end_time - start_time, "jobs": jobs}, f)
 
     return jobs
